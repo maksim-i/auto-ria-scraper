@@ -17,6 +17,34 @@ API_TOKEN = ''
 CHAT_ID = ''
 API_URL = f'https://api.telegram.org/bot{API_TOKEN}/sendMediaGroup'
 
+def handle_response(media):
+    while True:
+        response = requests.post(API_URL, json={
+            'chat_id': CHAT_ID, 'media': media})
+        r_json = response.json()
+        if r_json['ok'] == False:
+            if 'retry after' in r_json['description']:
+                timeout = r_json['parameters']['retry_after'] + 5
+                print(f'(!) too many requests, sleeping for {timeout} seconds')
+                sleep(timeout)
+                continue
+            elif 'Wrong type of the web page' in r_json['description']:
+                list_desc = list(r_json['description'])
+                bad_index = int(list_desc[list_desc.index('#') + 1]) - 1
+                media_send_correct = json.loads(media)
+                del media_send_correct[bad_index]
+                media = json.dumps(media_send_correct)
+                print(f'(!) retrying to send listing {car_id}')
+                sleep(2)
+                continue
+            else:
+                print(f'(!) error with listing {car_id}, investigate\n' + \
+                    str(media) + '\n' + str(r_json))
+                sleep(2)
+                continue
+        else:
+            break
+
 def collect_detailed(data, ids_in_db):
     for data_item in data:
         car_id = data_item[0]
@@ -33,12 +61,15 @@ def collect_detailed(data, ids_in_db):
             bidfax_link = page_data_load.select(
                 'script[data-bidfax-pathname]')[0]['data-bidfax-pathname'].\
             replace('/bidfax/', 'https://bidfax.info/')
+            dmg_data_link = 'https://webcache.googleusercontent.com/search?q='\
+            f'cache:{bidfax_link}'
+            dmg_data = requests.get(dmg_data_link)
+            dmg_data_load = BeautifulSoup(dmg_data.content, 'html.parser')
+            photos_dmg = ['https://bidfax.info' + item['src'] for item in \
+            dmg_data_load.select('ul.xfieldimagegallery.skrin img')]
             mileage = json.loads(page_data_load.select(
                 'script:-soup-contains("mileageFromOdometer")')[0].\
             getText())['mileageFromOdometer']['value']
-            # city name in Ukrainian (unused)
-            #city = page_data_load.select(
-            #    'a[href*="/legkovie/city/"]')[0].getText().replace('\n', '')
             city = page_data_load.select(
                 'a[href*="/legkovie/city/"]')[0]['href'][18:-1].capitalize().\
             replace('-', ' ')
@@ -51,44 +82,26 @@ def collect_detailed(data, ids_in_db):
             media_send = json.dumps(media_list)
 
             data_full = (car_id, link, price, make, '----'.join(photos),
-                bidfax_link, mileage, city, 'ACTIVE')
+                bidfax_link, mileage, city, '----'.join(photos_dmg), 'ACTIVE')
 
             c.execute('''
                 INSERT INTO cars (car_id, link, price, make, photos,
-                bidfax_link, mileage, city, status)
+                bidfax_link, mileage, city, photos_dmg, status)
                     VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                       ''', data_full)
 
-            while True:
-                response = requests.post(API_URL, json={'chat_id': CHAT_ID,
-                    'media': media_send})
-                r_json = response.json()
-                if r_json['ok'] == False:
-                    if 'retry after' in r_json['description']:
-                        timeout = r_json['parameters']['retry_after'] + 5
-                        print('(!) too many requests, sleeping for '\
-                            f'{timeout} seconds')
-                        sleep(timeout)
-                        continue
-                    elif 'Wrong type of the web page' in r_json['description']:
-                        list_desc = list(r_json['description'])
-                        bad_index = int(list_desc[list_desc.index('#') + 1]) - 1
-                        media_send_correct = json.loads(media_send)
-                        del media_send_correct[bad_index]
-                        media_send = json.dumps(media_send_correct)
-                        print(f'(!) retrying to send listing {car_id}')
-                        sleep(2)
-                        continue
-                    else:
-                        print(f'(!) error with listing {car_id}, investigate\n'\
-                         + str(media_send) + '\n' + str(r_json))
-                        sleep(2)
-                        continue
-                else:
-                    break
+            handle_response(media_send)
+            if len(photos_dmg) > 0:
+                sleep(1)
+                media_list_dmg = [{'type':'photo', 'media':photo} for photo in \
+                photos_dmg[:10]]
+                media_list_dmg[0].update({'parse_mode':'MarkdownV2',
+                    'caption':f'\U0001F194 {car_id}'})
+                media_send_dmg = json.dumps(media_list_dmg)
+                handle_response(media_send_dmg)
 
-            print(f'(i) listing {car_id} scraped')
+            print(f'listing {car_id} scraped')
             conn.commit()
             sleep(2)
 
@@ -124,7 +137,7 @@ def collect_data(sc):
                     '[data-currency="USD"]')[0].getText().replace(' ', ''))
                 data.append([car_id, link, price])
             page += 1
-            print(f'(i) page {page} scraped')
+            print(f'page {page} scraped')
             sleep(2)
         else:
             break
@@ -132,38 +145,36 @@ def collect_data(sc):
     API_URL_MSG = API_URL.replace('sendMediaGroup', 'sendMessage')
     data_sans_links = [[item[0], item[2]] for item in data]
     for item in data_sans_links:
-        if item not in ids_prices_db:
-            if item[0] in ids_in_db:
-                c.execute('''
-                SELECT price FROM cars
-                WHERE car_id = ?;
-                          ''', (item[0],))
-                old_price = c.fetchall()[0][0]
-                c.execute('''
-                UPDATE cars
-                SET price = ?
-                WHERE car_id = ?;
-                          ''', (item[1], item[0]))
-                conn.commit()
-                response = requests.post(API_URL_MSG, json={
-                    'chat_id': CHAT_ID, 'text': f'\U0001F194 {item[0]} - '\
-                    f'new price (${item[1]}, from ${old_price})'})
-                sleep(2)
+        if item not in ids_prices_db and item[0] in ids_in_db:
+            c.execute('''
+            SELECT price FROM cars
+            WHERE car_id = ?;
+                      ''', (item[0],))
+            old_price = c.fetchall()[0][0]
+            c.execute('''
+            UPDATE cars
+            SET price = ?
+            WHERE car_id = ?;
+                      ''', (item[1], item[0]))
+            conn.commit()
+            response = requests.post(API_URL_MSG, json={'chat_id': CHAT_ID,
+                'text': f'\U0001F194 {item[0]} - new price (${item[1]}, '\
+                f'from ${old_price})'})
+            sleep(2)
 
     ids_in_data = [item[0] for item in data_sans_links]
     for item in ids_prices_statuses_db:
-        if item[:-1] not in data_sans_links:
-            if item[0] not in ids_in_data and item[2] == 'ACTIVE':
-                c.execute('''
-                UPDATE cars
-                SET status = 'DELISTED'
-                WHERE car_id = ?;
-                          ''', (item[0],))
-                conn.commit()
-                response = requests.post(API_URL_MSG, json={
-                    'chat_id': CHAT_ID, 'text': f'\U0001F194 {item[0]} has '\
-                    'been sold (delisted)'})
-                sleep(2)
+        if item[:-1] not in data_sans_links and item[0] not in ids_in_data and \
+        item[2] == 'ACTIVE':
+            c.execute('''
+            UPDATE cars
+            SET status = 'DELISTED'
+            WHERE car_id = ?;
+                      ''', (item[0],))
+            conn.commit()
+            response = requests.post(API_URL_MSG, json={'chat_id': CHAT_ID,
+                'text': f'\U0001F194 {item[0]} has been sold (delisted)'})
+            sleep(2)
 
     collect_detailed(data, ids_in_db)
 
@@ -182,6 +193,7 @@ c.execute('''
         bidfax_link TEXT,
         mileage INTEGER,
         city TEXT,
+        photos_dmg TEXT,
         status TEXT
     );
           ''')
